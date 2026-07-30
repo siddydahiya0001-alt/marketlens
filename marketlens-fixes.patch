@@ -1,0 +1,1178 @@
+From 92ac3e12eb3d82ede5e410a4c7729e4ec37b6705 Mon Sep 17 00:00:00 2001
+From: bhappe <becker.istvan@gmail.com>
+Date: Thu, 30 Jul 2026 21:55:42 +0530
+Subject: [PATCH] Fix four correctness bugs in outcome matching, churn risk and
+ campaign wording
+
+All four produced confident but wrong answers on the project's own sample
+workbook, and the existing tests missed them because every fixture used
+clean "Yes"/"No" labels.
+
+Outcome label matching (utils/helpers.py + four call sites)
+  Matching a single exact string counted only one spelling of an outcome as
+  positive. On sample_data/marketing_sample.xlsx the Purchased column holds
+  seven spellings, so 297 buyers were counted as 14: purchase prediction
+  reported 97.4% accuracy for an all-negative model labelled "Very high
+  confidence", and the A/B test flipped from p=0.014 to p=0.293. New
+  positive_mask() treats affirmative spellings as equivalent when the whole
+  column is recognisably yes/no, compares numeric columns directly, and
+  otherwise falls back to normalised comparison so unrelated categories are
+  never merged. infer_positive_value() now prefers the most common
+  affirmative rather than the first in row order.
+
+Churn risk direction (analyses/churn_analysis.py)
+  Keywords were matched against an underscored slug, so "dayssince" could
+  never match Days_Since_Last_Purchase, which then fell through to the
+  risk-decreasing list on the stray word "purchase". The most dormant
+  customers scored as the safest: correlation between risk score and days
+  since last purchase was -0.52, now +0.51. Keywords now match a compacted
+  slug, with recency signals ordered ahead of the decreasing list, and the
+  lists cover the value signals that were defaulting to "higher is riskier".
+
+Main risk reason (analyses/churn_analysis.py)
+  Picking the largest magnitude regardless of sign named protective factors
+  as risk reasons - a customer buying far more often than average was told
+  their "purchase frequency has declined". Only contributions above zero can
+  be a reason now, and customers with no risk signal are told so. Two related
+  defects fixed alongside: top_reasons was counted across all customers
+  though the headline describes the high-risk group, and supervised mode
+  could reuse a phrase whose assumed direction contradicted the sign the
+  model actually learned.
+
+Campaign headline (services/interpretation_service.py)
+  better_campaign is always the higher-converting group, but the wording came
+  from the sign of the difference, which is measured from the test group. When
+  the control group won, the sentence named the winner and said it performed
+  lower. The gap is also reported in percentage points rather than "%", with
+  both underlying rates quoted and a tie case handled.
+
+Tests: 46 -> 119. New suites cover outcome-label equivalence, churn direction
+and reason attribution, and the campaign headline in both directions, each
+running against the shipped workbook in its raw uncleaned state. All 40 new
+assertions were verified to fail against the previous implementation.
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+---
+ analyses/campaign_comparison.py    |  10 +-
+ analyses/channel_performance.py    |   7 +-
+ analyses/churn_analysis.py         | 117 +++++++++--
+ analyses/purchase_prediction.py    |   4 +-
+ services/interpretation_service.py |  32 ++-
+ tests/sample_workbook.py           |  23 +++
+ tests/test_campaign_headline.py    |  98 +++++++++
+ tests/test_churn_analysis.py       | 309 +++++++++++++++++++++++++++++
+ tests/test_outcome_labels.py       | 242 ++++++++++++++++++++++
+ utils/helpers.py                   |  67 ++++++-
+ 10 files changed, 874 insertions(+), 35 deletions(-)
+ create mode 100644 tests/sample_workbook.py
+ create mode 100644 tests/test_campaign_headline.py
+ create mode 100644 tests/test_churn_analysis.py
+ create mode 100644 tests/test_outcome_labels.py
+
+diff --git a/analyses/campaign_comparison.py b/analyses/campaign_comparison.py
+index a478f6c..f31eccf 100644
+--- a/analyses/campaign_comparison.py
++++ b/analyses/campaign_comparison.py
+@@ -7,7 +7,7 @@ import pandas as pd
+ from statsmodels.stats.proportion import proportions_ztest, proportion_confint
+ 
+ from services import validation_service as vs
+-from utils.helpers import safe_divide, infer_positive_value
++from utils.helpers import safe_divide, infer_positive_value, positive_mask
+ 
+ 
+ def run_analysis(df: pd.DataFrame, campaign_col: str, outcome_col: str, revenue_col: str | None,
+@@ -30,9 +30,13 @@ def run_analysis(df: pd.DataFrame, campaign_col: str, outcome_col: str, revenue_
+     warnings += vs.check_dataset_size(control_df, min_rows=20)
+     warnings += vs.check_dataset_size(test_df, min_rows=20)
+ 
++    # Decide what counts as a conversion across the whole column, then slice - so both
++    # groups are scored against the same rule even if one group happens to use only a
++    # subset of the spellings present in the data.
+     positive_value = infer_positive_value(df[outcome_col])
+-    control_conversions = int((control_df[outcome_col] == positive_value).sum())
+-    test_conversions = int((test_df[outcome_col] == positive_value).sum())
++    converted = positive_mask(df[outcome_col], positive_value)
++    control_conversions = int(converted.loc[control_df.index].sum())
++    test_conversions = int(converted.loc[test_df.index].sum())
+     n_control, n_test = len(control_df), len(test_df)
+ 
+     control_rate = safe_divide(control_conversions, n_control)
+diff --git a/analyses/channel_performance.py b/analyses/channel_performance.py
+index 296b511..1ae5d66 100644
+--- a/analyses/channel_performance.py
++++ b/analyses/channel_performance.py
+@@ -5,7 +5,7 @@ from __future__ import annotations
+ import pandas as pd
+ 
+ from services import validation_service as vs
+-from utils.helpers import safe_divide, infer_positive_value
++from utils.helpers import safe_divide, infer_positive_value, positive_mask
+ 
+ 
+ def run_analysis(df: pd.DataFrame, channel_col: str, revenue_col: str | None, cost_col: str | None,
+@@ -26,8 +26,9 @@ def run_analysis(df: pd.DataFrame, channel_col: str, revenue_col: str | None, co
+ 
+     if outcome_col and outcome_col in df.columns:
+         positive_value = infer_positive_value(df[outcome_col]) if df[outcome_col].notna().any() else None
+-        conv = df.groupby(channel_col)[outcome_col].apply(
+-            lambda s: safe_divide((s == positive_value).sum(), len(s))
++        converted = positive_mask(df[outcome_col], positive_value)
++        conv = converted.groupby(df[channel_col]).apply(
++            lambda s: safe_divide(s.sum(), len(s))
+         ).reset_index()
+         conv.columns = [channel_col, "Conversion rate"]
+         channel_summary = channel_summary.merge(conv, on=channel_col, how="left")
+diff --git a/analyses/churn_analysis.py b/analyses/churn_analysis.py
+index 9a428cc..f737edb 100644
+--- a/analyses/churn_analysis.py
++++ b/analyses/churn_analysis.py
+@@ -17,24 +17,57 @@ from sklearn.linear_model import LogisticRegression
+ from sklearn.preprocessing import StandardScaler
+ 
+ from services import validation_service as vs
+-from utils.helpers import slugify, infer_positive_value
+-
+-RISK_INCREASES_WITH_VALUE = ["recency", "dayssince", "delay", "complaint", "cost", "churn"]
+-RISK_DECREASES_WITH_VALUE = ["frequency", "visit", "engagement", "loyalty", "tenure", "spend", "revenue", "purchase"]
++from utils.helpers import slugify, infer_positive_value, positive_mask
++
++# Keywords are matched against a *compacted* slug (separators removed), so a
++# multi-word keyword like "dayssince" matches a real column name such as
++# "Days_Since_Last_Purchase". Matching against the underscored slug would never
++# fire, and the name would then fall through to the risk-decreasing list on the
++# stray word "purchase" - scoring the most dormant customers as the safest.
++#
++# Order matters: "since"/"recency" style signals are checked first, because a
++# column like "days_since_last_purchase" contains a risk-decreasing word too and
++# the recency meaning must win.
++RISK_INCREASES_WITH_VALUE = [
++    "recency", "dayssince", "since", "lapsed", "dormant", "inactive",
++    "delay", "late", "complaint", "refund", "cancel", "churn",
++    "unsubscrib", "bounce", "cost",
++]
++RISK_DECREASES_WITH_VALUE = [
++    "frequency", "visit", "session", "login", "click", "open", "engagement",
++    "loyalty", "tenure", "subscription", "spend", "revenue", "sales", "profit",
++    "margin", "income", "ordervalue", "aov", "monetary", "basket", "purchase",
++]
+ 
+ FRIENDLY_REASON = {
+     "recency": "the customer has not purchased recently",
+     "dayssince": "the customer has not purchased recently",
++    "since": "the customer has not purchased recently",
++    "lapsed": "the customer has gone quiet",
++    "dormant": "the customer has gone quiet",
+     "delay": "recent orders had delivery delays",
+     "complaint": "a recent complaint was recorded",
++    "refund": "a recent refund was recorded",
++    "cancel": "a recent cancellation was recorded",
+     "frequency": "purchase frequency has declined",
+     "visit": "website engagement has dropped",
++    "session": "website engagement has dropped",
++    "login": "the customer signs in less often",
+     "engagement": "engagement has dropped",
++    "spend": "spending has fallen below the typical level",
++    "revenue": "spending has fallen below the typical level",
++    "ordervalue": "order values are below the typical level",
+ }
+ 
+ 
++def _compact_slug(col: str) -> str:
++    """Slug with separators removed, so multi-word keywords match real column names."""
++    return slugify(col).replace("_", "")
++
++
+ def _direction_for_column(col: str) -> int:
+-    slug = slugify(col)
++    """+1 if a higher value means more churn risk, -1 if a higher value means less."""
++    slug = _compact_slug(col)
+     for keyword in RISK_INCREASES_WITH_VALUE:
+         if keyword in slug:
+             return 1
+@@ -45,11 +78,11 @@ def _direction_for_column(col: str) -> int:
+ 
+ 
+ def _friendly_reason(col: str) -> str:
+-    slug = slugify(col)
++    slug = _compact_slug(col)
+     for keyword, phrase in FRIENDLY_REASON.items():
+         if keyword in slug:
+             return phrase
+-    return f"'{col}' is unusual compared to other customers"
++    return _generic_reason(col)
+ 
+ 
+ def run_analysis(df: pd.DataFrame, risk_signal_cols: list, roles: dict, known_churn_col: str | None = None) -> dict:
+@@ -76,6 +109,63 @@ def run_analysis(df: pd.DataFrame, risk_signal_cols: list, roles: dict, known_ch
+     return result
+ 
+ 
++NO_STANDOUT_REASON = "no individual warning signal stands out for this customer"
++
++
++def _generic_reason(col: str) -> str:
++    return f"'{col}' is unusual compared to other customers"
++
++
++def _main_risk_reasons(risk_contributions: pd.DataFrame, phrase_for=None) -> pd.Series:
++    """Name the signal pushing each customer's risk *up* the hardest.
++
++    Takes a frame where a positive value means "this signal raises risk" and a
++    negative value means "this signal lowers it". Picking the largest magnitude
++    regardless of sign would name a protective factor as a risk reason - a
++    customer buying far more often than average would be told their "purchase
++    frequency has declined". Only signals above zero can be a reason, and a
++    customer whose signals are all protective is told so honestly rather than
++    being given the least reassuring one.
++    """
++    phrase_for = phrase_for or _friendly_reason
++    strongest = risk_contributions.idxmax(axis=1)
++    has_risk_signal = risk_contributions.max(axis=1) > 0
++    return strongest.map(phrase_for).where(has_risk_signal, NO_STANDOUT_REASON)
++
++
++def _trustworthy_phrase_lookup(coefficients: pd.Series):
++    """Phrase chooser for the supervised model.
++
++    The friendly phrases are written for the direction business sense expects
++    ("purchase frequency has declined" assumes low frequency is the risky end).
++    A trained model can learn the opposite sign from the data, and reusing the
++    phrase then states the reverse of what the model actually found. Where the
++    learned sign disagrees with the expected direction, fall back to neutral
++    wording that stays true either way.
++    """
++    def phrase_for(col: str) -> str:
++        learned_direction = 1 if coefficients.get(col, 0) > 0 else -1
++        if learned_direction != _direction_for_column(col):
++            return _generic_reason(col)
++        return _friendly_reason(col)
++
++    return phrase_for
++
++
++def _top_reasons_for_high_risk(risk_df: pd.DataFrame) -> list:
++    """Most common reasons among the high-risk customers specifically.
++
++    The headline and recommendations talk about why the *at-risk* customers are
++    at risk, so counting reasons across everyone would let the low-risk majority
++    decide what the at-risk group is told to do. Falls back to the whole
++    population when nothing reached the high-risk band.
++    """
++    high_risk = risk_df[risk_df["Risk group"] == "High"]
++    population = high_risk if len(high_risk) else risk_df
++    counts = population["Main risk reason"].value_counts()
++    return [reason for reason in counts.index.tolist() if reason != NO_STANDOUT_REASON]
++
++
+ def _heuristic_risk(df: pd.DataFrame, numeric_cols: list, warnings: list) -> dict:
+     scaler = StandardScaler()
+     z = pd.DataFrame(scaler.fit_transform(df[numeric_cols]), columns=numeric_cols, index=df.index)
+@@ -88,16 +178,14 @@ def _heuristic_risk(df: pd.DataFrame, numeric_cols: list, warnings: list) -> dic
+     raw_score = signed.mean(axis=1)
+     risk_score_0_100 = ((raw_score - raw_score.min()) / (raw_score.max() - raw_score.min() + 1e-9) * 100)
+ 
+-    main_reason_idx = signed.abs().idxmax(axis=1)
+-    main_reasons = main_reason_idx.map(_friendly_reason)
++    main_reasons = _main_risk_reasons(signed)
+ 
+     risk_df = df.copy()
+     risk_df["Risk score"] = risk_score_0_100.round(1)
+     risk_df["Main risk reason"] = main_reasons
+     risk_df["Risk group"] = pd.cut(risk_score_0_100, bins=[-1, 33, 66, 100], labels=["Low", "Medium", "High"])
+ 
+-    reason_counts = main_reasons.value_counts()
+-    top_reasons = reason_counts.index.tolist()
++    top_reasons = _top_reasons_for_high_risk(risk_df)
+ 
+     warnings.append(
+         "No confirmed churn outcome was provided, so this risk score is based on behaviour patterns "
+@@ -119,7 +207,7 @@ def _heuristic_risk(df: pd.DataFrame, numeric_cols: list, warnings: list) -> dic
+ 
+ def _supervised_risk(df: pd.DataFrame, numeric_cols: list, churn_col: str, warnings: list) -> dict:
+     positive_value = infer_positive_value(df[churn_col])
+-    y = (df[churn_col] == positive_value).astype(int)
++    y = positive_mask(df[churn_col], positive_value).astype(int)
+     warnings += vs.check_target_outcomes(y.map({1: "Yes", 0: "No"}))
+ 
+     scaler = StandardScaler()
+@@ -136,15 +224,14 @@ def _supervised_risk(df: pd.DataFrame, numeric_cols: list, churn_col: str, warni
+     coefs = pd.Series(model.coef_[0], index=numeric_cols)
+     contributions = X * coefs
+ 
+-    main_reason_idx = contributions.abs().idxmax(axis=1)
+-    main_reasons = main_reason_idx.map(_friendly_reason)
++    main_reasons = _main_risk_reasons(contributions, _trustworthy_phrase_lookup(coefs))
+ 
+     risk_df = df.copy()
+     risk_df["Risk score"] = (probabilities * 100).round(1)
+     risk_df["Main risk reason"] = main_reasons
+     risk_df["Risk group"] = pd.cut(probabilities * 100, bins=[-1, 33, 66, 100], labels=["Low", "Medium", "High"])
+ 
+-    top_reasons = main_reasons.value_counts().index.tolist()
++    top_reasons = _top_reasons_for_high_risk(risk_df)
+ 
+     return {
+         "ok": True,
+diff --git a/analyses/purchase_prediction.py b/analyses/purchase_prediction.py
+index 10e21b9..4e0ff3b 100644
+--- a/analyses/purchase_prediction.py
++++ b/analyses/purchase_prediction.py
+@@ -12,7 +12,7 @@ from sklearn.metrics import (
+ )
+ 
+ from services import validation_service as vs
+-from utils.helpers import infer_positive_value
++from utils.helpers import infer_positive_value, positive_mask
+ 
+ 
+ def _encode_features(df: pd.DataFrame, factor_cols: list) -> pd.DataFrame:
+@@ -46,7 +46,7 @@ def run_analysis(df: pd.DataFrame, outcome_col: str, factor_cols: list, roles: d
+ 
+     if positive_value is None:
+         positive_value = infer_positive_value(working[outcome_col])
+-    y = (working[outcome_col] == positive_value).astype(int)
++    y = positive_mask(working[outcome_col], positive_value).astype(int)
+ 
+     warnings += vs.check_target_outcomes(y.map({1: "Yes", 0: "No"}))
+     warnings += vs.check_missing_data(working, clean_factors)
+diff --git a/services/interpretation_service.py b/services/interpretation_service.py
+index 1724dcd..a096d2d 100644
+--- a/services/interpretation_service.py
++++ b/services/interpretation_service.py
+@@ -188,7 +188,6 @@ class RuleBasedInterpreter(InterpretationService):
+         diff_pct = result.get("conversion_diff_pct", 0)
+         better = result.get("better_campaign", "The tested campaign")
+         p_value = result.get("p_value")
+-        direction = "higher" if diff_pct >= 0 else "lower"
+ 
+         n_control = result.get("n_control", 0)
+         n_test = result.get("n_test", 0)
+@@ -219,9 +218,8 @@ class RuleBasedInterpreter(InterpretationService):
+             )
+ 
+         return {
+-            "main_answer": (
+-                f"'{better}' produced a {abs(diff_pct):.0f}% {direction} conversion rate than "
+-                f"'{comparison_group}'."
++            "main_answer": _campaign_headline(
++                better, comparison_group, diff_pct, control_group, control_rate, test_rate,
+             ),
+             "explanation": confidence_sentence(p_value) if p_value is not None else
+                 "Not enough information to judge statistical confidence.",
+@@ -230,6 +228,32 @@ class RuleBasedInterpreter(InterpretationService):
+         }
+ 
+ 
++def _campaign_headline(better, comparison_group, diff_pct, control_group, control_rate, test_rate) -> str:
++    """State which group converted better, by how much, and on what base.
++
++    `better_campaign` is always the higher-converting group, so the comparison
++    reads "higher" from its point of view regardless of which side happened to
++    be the test group. Deriving the wording from the sign of the difference
++    instead - which is measured from the *test* group - flipped the sentence
++    whenever the control group won, reporting the winner as the loser.
++
++    The gap is stated in percentage points, not "%": a move from 40.6% to 51.8%
++    is 11.2 percentage points, not an 11.2% increase.
++    """
++    if diff_pct == 0:
++        return f"'{better}' and '{comparison_group}' converted at the same rate."
++
++    better_rate = control_rate if better == control_group else test_rate
++    worse_rate = test_rate if better == control_group else control_rate
++
++    sentence = (
++        f"'{better}' converted {abs(diff_pct):.1f} percentage points higher than '{comparison_group}'"
++    )
++    if better_rate is not None and worse_rate is not None:
++        sentence += f" ({better_rate * 100:.1f}% versus {worse_rate * 100:.1f}%)"
++    return sentence + "."
++
++
+ def _confidence_from_accuracy(accuracy: float) -> str:
+     if accuracy >= 0.85:
+         return "Very high confidence"
+diff --git a/tests/sample_workbook.py b/tests/sample_workbook.py
+new file mode 100644
+index 0000000..daf949c
+--- /dev/null
++++ b/tests/sample_workbook.py
+@@ -0,0 +1,23 @@
++"""Access to the shipped sample workbook for tests.
++
++Tests that use this run against the exact file a first-time user uploads -
++messy labels, missing values, duplicates and all - which is where bugs that
++clean synthetic fixtures cannot reach tend to hide.
++"""
++
++import os
++
++import pandas as pd
++import pytest
++
++SAMPLE_PATH = os.path.join(
++    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
++    "sample_data", "marketing_sample.xlsx",
++)
++
++
++def load_sample_customer_data() -> pd.DataFrame:
++    """Load the Customer_Data sheet exactly as uploaded, with no cleaning applied."""
++    if not os.path.exists(SAMPLE_PATH):
++        pytest.skip("sample_data/marketing_sample.xlsx is not present")
++    return pd.read_excel(SAMPLE_PATH, sheet_name="Customer_Data")
+diff --git a/tests/test_campaign_headline.py b/tests/test_campaign_headline.py
+new file mode 100644
+index 0000000..2fa8ff4
+--- /dev/null
++++ b/tests/test_campaign_headline.py
+@@ -0,0 +1,98 @@
++"""Regression tests for the campaign-comparison headline sentence.
++
++`better_campaign` is always the higher-converting group, but the wording used
++to be derived from the sign of the difference - which is measured from the test
++group. When the control group won, the sentence named the winner and then said
++it performed *lower*, reversing the finding. The gap was also reported as "%"
++when it is a difference in percentage points.
++"""
++
++import pandas as pd
++import pytest
++
++from analyses import campaign_comparison
++from services.interpretation_service import get_interpreter
++
++
++def _result(control_rate, test_rate, p_value=0.01,
++            control_group="Campaign A", test_group="Campaign B"):
++    diff_pct = (test_rate - control_rate) * 100
++    return {
++        "control_group": control_group,
++        "test_group": test_group,
++        "n_control": 100,
++        "n_test": 100,
++        "control_conversion_rate": control_rate,
++        "test_conversion_rate": test_rate,
++        "conversion_diff_pct": diff_pct,
++        "better_campaign": test_group if diff_pct >= 0 else control_group,
++        "p_value": p_value,
++    }
++
++
++def _headline(control_rate, test_rate, **kwargs):
++    return get_interpreter().interpret_campaign_comparison(
++        _result(control_rate, test_rate, **kwargs))["main_answer"]
++
++
++def test_headline_names_the_control_group_as_higher_when_it_wins():
++    """The bug: 'Campaign A' won on 20% vs 15% but was reported as 'lower'."""
++    headline = _headline(control_rate=0.20, test_rate=0.15)
++    assert "'Campaign A' converted" in headline
++    assert "higher" in headline
++    assert "lower" not in headline
++
++
++def test_headline_names_the_test_group_as_higher_when_it_wins():
++    headline = _headline(control_rate=0.15, test_rate=0.20)
++    assert "'Campaign B' converted" in headline
++    assert "higher" in headline
++    assert "lower" not in headline
++
++
++@pytest.mark.parametrize("control_rate,test_rate,winner,loser", [
++    (0.20, 0.15, "Campaign A", "Campaign B"),
++    (0.15, 0.20, "Campaign B", "Campaign A"),
++])
++def test_headline_always_puts_the_winner_first(control_rate, test_rate, winner, loser):
++    headline = _headline(control_rate, test_rate)
++    assert headline.index(winner) < headline.index(loser)
++
++
++def test_headline_reports_the_gap_in_percentage_points_not_percent():
++    """40.6% -> 51.8% is 11.2 percentage points, not an 11.2% increase."""
++    headline = _headline(control_rate=0.518, test_rate=0.406)
++    assert "11.2 percentage points" in headline
++    assert "11.2%" not in headline
++    assert "11%" not in headline
++
++
++def test_headline_quotes_both_underlying_rates():
++    headline = _headline(control_rate=0.518, test_rate=0.406)
++    assert "51.8%" in headline
++    assert "40.6%" in headline
++
++
++def test_headline_handles_an_exact_tie_without_claiming_a_winner():
++    headline = _headline(control_rate=0.20, test_rate=0.20)
++    assert "same rate" in headline
++    assert "higher" not in headline
++    assert "lower" not in headline
++
++
++def test_headline_is_consistent_with_better_campaign_end_to_end():
++    """Run the real analysis with a control group that outperforms the test
++    group, and check the sentence agrees with the computed winner."""
++    df = pd.DataFrame({
++        "campaign": ["A"] * 100 + ["B"] * 100,
++        "purchased": (["Yes"] * 60 + ["No"] * 40) + (["Yes"] * 25 + ["No"] * 75),
++    })
++    result = campaign_comparison.run_analysis(df, "campaign", "purchased", None, None, "A", "B")
++    assert result["ok"]
++    assert result["better_campaign"] == "A"
++    assert result["control_conversion_rate"] > result["test_conversion_rate"]
++
++    headline = get_interpreter().interpret_campaign_comparison(result)["main_answer"]
++    assert headline.startswith("'A' converted")
++    assert "higher" in headline
++    assert "35.0 percentage points" in headline
+diff --git a/tests/test_churn_analysis.py b/tests/test_churn_analysis.py
+new file mode 100644
+index 0000000..0589b43
+--- /dev/null
++++ b/tests/test_churn_analysis.py
+@@ -0,0 +1,309 @@
++"""Regression tests for churn risk direction and scoring.
++
++The heuristic risk score assigns each behaviour signal a direction from its
++column name. Keywords were matched against an underscored slug, so a
++multi-word keyword like "dayssince" could never match a real column such as
++"Days_Since_Last_Purchase" - which then fell through to the risk-*decreasing*
++list on the stray word "purchase". The most dormant customers were scored as
++the safest. These tests pin the direction of every signal the shipped sample
++data uses.
++"""
++
++import numpy as np
++import pandas as pd
++import pytest
++
++from analyses import churn_analysis
++from analyses.churn_analysis import (
++    NO_STANDOUT_REASON, _direction_for_column, _friendly_reason,
++)
++
++from tests.sample_workbook import load_sample_customer_data
++
++
++# ---------------------------------------------------------------------------
++# Direction of each signal
++# ---------------------------------------------------------------------------
++
++RISK_INCREASING_COLUMNS = [
++    "Days_Since_Last_Purchase",
++    "days since last purchase",
++    "DaysSinceLastOrder",
++    "Months_Since_Last_Visit",
++    "Recency",
++    "Customer_Service_Complaints",
++    "Delivery_Delay_Days",
++    "Refund_Count",
++    "Cancelled_Orders",
++]
++
++RISK_DECREASING_COLUMNS = [
++    "Purchase_Frequency",
++    "Website_Visits",
++    "Average_Order_Value",
++    "Total_Spend",
++    "Revenue",
++    "Income",
++    "Loyalty_Points",
++    "Tenure_Months",
++    "Engagement_Score",
++]
++
++
++@pytest.mark.parametrize("column", RISK_INCREASING_COLUMNS)
++def test_higher_value_increases_risk(column):
++    assert _direction_for_column(column) == 1, f"{column} should raise churn risk"
++
++
++@pytest.mark.parametrize("column", RISK_DECREASING_COLUMNS)
++def test_higher_value_decreases_risk(column):
++    assert _direction_for_column(column) == -1, f"{column} should lower churn risk"
++
++
++def test_recency_wins_over_the_word_purchase_in_the_same_name():
++    """'Days_Since_Last_Purchase' contains 'purchase', but it is a recency
++    signal - the recency meaning must take priority."""
++    assert _direction_for_column("Days_Since_Last_Purchase") == 1
++    assert _direction_for_column("Purchase_Frequency") == -1
++
++
++def test_recency_columns_get_a_recency_reason_not_the_generic_fallback():
++    assert _friendly_reason("Days_Since_Last_Purchase") == "the customer has not purchased recently"
++    assert _friendly_reason("Purchase_Frequency") == "purchase frequency has declined"
++    assert _friendly_reason("Delivery_Delay_Days") == "recent orders had delivery delays"
++    assert _friendly_reason("Customer_Service_Complaints") == "a recent complaint was recorded"
++
++
++def test_unknown_columns_fall_back_to_a_generic_reason():
++    assert "unusual compared to other customers" in _friendly_reason("Some_Unmapped_Column")
++
++
++# ---------------------------------------------------------------------------
++# End-to-end scoring
++# ---------------------------------------------------------------------------
++
++def _churn_df():
++    """One clearly dormant customer among otherwise identical regulars.
++
++    Deliberately built from recency and frequency only. Adding a complaint
++    column would let that signal carry the result and hide an inverted recency
++    direction, which is the bug these tests exist to catch.
++    """
++    return pd.DataFrame({
++        "Days_Since_Last_Purchase": [10, 12, 11, 9, 300],
++        "Purchase_Frequency": [8, 7, 9, 8, 2],
++    })
++
++
++def test_dormant_customer_scores_higher_risk_than_regulars():
++    df = _churn_df()
++    result = churn_analysis.run_analysis(df, list(df.columns), {}, None)
++    assert result["ok"]
++
++    scores = result["risk_df"]["Risk score"]
++    dormant_score = scores.iloc[-1]
++    assert dormant_score == scores.max()
++    assert dormant_score > scores.iloc[:-1].max()
++
++
++def test_dormant_customer_lands_in_the_high_risk_group():
++    df = _churn_df()
++    result = churn_analysis.run_analysis(df, list(df.columns), {}, None)
++    assert result["risk_df"]["Risk group"].iloc[-1] == "High"
++    assert result["n_high"] >= 1
++
++
++def test_loyal_customer_is_not_labelled_at_risk():
++    df = _churn_df()
++    result = churn_analysis.run_analysis(df, list(df.columns), {}, None)
++    regulars = result["risk_df"].iloc[:-1]
++    assert (regulars["Risk group"] != "High").all()
++
++
++def test_high_spend_does_not_raise_risk():
++    """Average_Order_Value has no risk keyword of its own; it must not default
++    to 'higher is riskier' and flag the best customers."""
++    df = pd.DataFrame({
++        "Average_Order_Value": [50, 55, 52, 48, 500],
++        "Days_Since_Last_Purchase": [20, 20, 20, 20, 20],
++    })
++    result = churn_analysis.run_analysis(df, list(df.columns), {}, None)
++    scores = result["risk_df"]["Risk score"]
++    assert scores.iloc[-1] == scores.min()
++
++
++def test_heuristic_mode_discloses_that_no_outcome_was_used():
++    df = _churn_df()
++    result = churn_analysis.run_analysis(df, list(df.columns), {}, None)
++    assert result["mode"] == "heuristic"
++    assert any("no confirmed churn outcome" in w.lower() for w in result["limitations"])
++
++
++def test_supervised_mode_used_when_a_known_outcome_is_supplied():
++    rng = np.random.default_rng(11)
++    n = 120
++    recency = rng.integers(1, 200, n)
++    df = pd.DataFrame({
++        "Days_Since_Last_Purchase": recency,
++        "Purchase_Frequency": rng.integers(1, 12, n),
++        "Churned": np.where(recency > 100, "Yes", "No"),
++    })
++    result = churn_analysis.run_analysis(
++        df, ["Days_Since_Last_Purchase", "Purchase_Frequency"], {}, "Churned")
++    assert result["ok"]
++    assert result["mode"] == "supervised"
++    # The churned rows are the dormant ones, so risk must track recency upward.
++    assert result["risk_df"]["Risk score"].corr(df["Days_Since_Last_Purchase"]) > 0.5
++
++
++def test_requires_at_least_one_numeric_signal():
++    df = pd.DataFrame({"City": ["Pune", "Delhi"]})
++    result = churn_analysis.run_analysis(df, ["City"], {}, None)
++    assert not result["ok"]
++
++
++# ---------------------------------------------------------------------------
++# "Main risk reason" must name a risk driver, never a protective factor
++# ---------------------------------------------------------------------------
++
++def test_loyal_customer_is_not_told_their_frequency_declined():
++    """The strongest signal for this customer is a protective one - buying far
++    more often than anyone else. Picking the largest magnitude regardless of
++    sign used to report that as the reason they are at risk."""
++    df = pd.DataFrame({
++        "Days_Since_Last_Purchase": [10, 10, 10, 10, 10],
++        "Purchase_Frequency": [50, 3, 3, 3, 3],
++    })
++    result = churn_analysis.run_analysis(df, list(df.columns), {}, None)
++    loyal = result["risk_df"].iloc[0]
++    assert loyal["Main risk reason"] != "purchase frequency has declined"
++    assert loyal["Main risk reason"] == NO_STANDOUT_REASON
++
++
++def test_reason_names_the_signal_that_actually_raises_risk():
++    df = pd.DataFrame({
++        "Days_Since_Last_Purchase": [10, 10, 10, 400],
++        "Purchase_Frequency": [8, 8, 8, 8],
++        "Customer_Service_Complaints": [0, 0, 0, 0],
++    })
++    result = churn_analysis.run_analysis(df, list(df.columns), {}, None)
++    assert result["risk_df"]["Main risk reason"].iloc[-1] == "the customer has not purchased recently"
++
++
++def test_complaint_driven_customer_gets_the_complaint_reason():
++    df = pd.DataFrame({
++        "Days_Since_Last_Purchase": [30, 30, 30, 30],
++        "Purchase_Frequency": [8, 8, 8, 8],
++        "Customer_Service_Complaints": [0, 0, 0, 5],
++    })
++    result = churn_analysis.run_analysis(df, list(df.columns), {}, None)
++    assert result["risk_df"]["Main risk reason"].iloc[-1] == "a recent complaint was recorded"
++
++
++def test_customers_with_only_protective_signals_are_told_so_honestly():
++    df = pd.DataFrame({
++        "Days_Since_Last_Purchase": [5, 200, 200, 200],
++        "Purchase_Frequency": [40, 2, 2, 2],
++    })
++    result = churn_analysis.run_analysis(df, list(df.columns), {}, None)
++    assert result["risk_df"]["Main risk reason"].iloc[0] == NO_STANDOUT_REASON
++
++
++def test_placeholder_reason_never_reaches_the_headline_or_recommendations():
++    df = pd.DataFrame({
++        "Days_Since_Last_Purchase": [5, 200, 200, 200],
++        "Purchase_Frequency": [40, 2, 2, 2],
++    })
++    result = churn_analysis.run_analysis(df, list(df.columns), {}, None)
++    assert NO_STANDOUT_REASON not in result["top_reasons"]
++
++
++def test_top_reasons_describe_the_high_risk_customers_not_everyone():
++    """The headline says at-risk customers are at risk 'most often because
++    <top reason>', so the low-risk majority must not decide what it says.
++
++    This fixture is built so the two answers differ: complaints are the most
++    common reason across the whole file, but the customers who actually reach
++    the high-risk band are there because they have gone quiet.
++    """
++    df = pd.DataFrame({
++        # Three dormant customers, driven by recency.
++        "Days_Since_Last_Purchase": [400, 380, 390] + [10] * 30,
++        # Thirty ordinary customers, half of them with a single complaint.
++        "Customer_Service_Complaints": [0, 0, 0] + [1, 0] * 15,
++    })
++    result = churn_analysis.run_analysis(df, list(df.columns), {}, None)
++    risk_df = result["risk_df"]
++
++    high_risk = risk_df[risk_df["Risk group"] == "High"]
++    assert len(high_risk) == 3
++
++    population_mode = risk_df["Main risk reason"].value_counts().index[0]
++    assert population_mode == "a recent complaint was recorded"
++
++    # The headline must follow the high-risk group, not the population.
++    assert result["top_reasons"][0] == "the customer has not purchased recently"
++    assert result["top_reasons"][0] != population_mode
++
++
++def _supervised_df(seed=23, n=150):
++    rng = np.random.default_rng(seed)
++    recency = rng.integers(1, 300, n)
++    return pd.DataFrame({
++        "Days_Since_Last_Purchase": recency,
++        # Pure noise, so the model's learned sign for it is arbitrary.
++        "Purchase_Frequency": rng.integers(1, 15, n),
++        "Churned": np.where(recency > 150, "Yes", "No"),
++    })
++
++
++def _run_supervised(df):
++    result = churn_analysis.run_analysis(
++        df, ["Days_Since_Last_Purchase", "Purchase_Frequency"], {}, "Churned")
++    assert result["mode"] == "supervised"
++    return result
++
++
++def test_supervised_reason_matches_the_direction_the_model_learned():
++    """The phrase 'purchase frequency has declined' assumes low frequency is the
++    risky end. When the model learns the opposite sign from the data, reusing
++    that phrase would state the reverse of the finding - so it must not appear
++    for customers whose frequency is above average."""
++    df = _supervised_df()
++    risk_df = _run_supervised(df)["risk_df"]
++
++    blamed_on_frequency = risk_df["Main risk reason"] == "purchase frequency has declined"
++    above_average = risk_df["Purchase_Frequency"] > risk_df["Purchase_Frequency"].mean()
++    assert not (blamed_on_frequency & above_average).any()
++
++
++def test_supervised_riskiest_customers_get_a_concrete_reason():
++    risk_df = _run_supervised(_supervised_df())["risk_df"]
++    riskiest = risk_df.nlargest(10, "Risk score")
++    assert (riskiest["Main risk reason"] != NO_STANDOUT_REASON).all()
++
++
++def test_supervised_dormant_customers_are_blamed_on_recency():
++    risk_df = _run_supervised(_supervised_df())["risk_df"]
++    dormant = risk_df.nlargest(10, "Days_Since_Last_Purchase")
++    assert (dormant["Main risk reason"] == "the customer has not purchased recently").all()
++
++
++# ---------------------------------------------------------------------------
++# The shipped sample workbook
++# ---------------------------------------------------------------------------
++
++def test_sample_data_dormant_customers_rank_as_higher_risk():
++    df = load_sample_customer_data()
++    signals = ["Days_Since_Last_Purchase", "Purchase_Frequency",
++               "Customer_Service_Complaints", "Delivery_Delay_Days"]
++    result = churn_analysis.run_analysis(df, signals, {}, None)
++    assert result["ok"]
++
++    risk_df = result["risk_df"]
++    correlation = risk_df["Risk score"].corr(risk_df["Days_Since_Last_Purchase"])
++    assert correlation > 0, "risk score must rise with days since last purchase"
++
++    most_dormant = risk_df.nlargest(50, "Days_Since_Last_Purchase")["Risk score"].mean()
++    most_recent = risk_df.nsmallest(50, "Days_Since_Last_Purchase")["Risk score"].mean()
++    assert most_dormant > most_recent
+diff --git a/tests/test_outcome_labels.py b/tests/test_outcome_labels.py
+new file mode 100644
+index 0000000..55e5e85
+--- /dev/null
++++ b/tests/test_outcome_labels.py
+@@ -0,0 +1,242 @@
++"""Regression tests for messy Yes/No outcome labels.
++
++Real spreadsheets spell the same outcome several ways in one column ("Yes",
++"yes", "Y", "Purchased"). Matching a single exact string counted only one
++spelling as a conversion and silently treated the rest as non-conversions,
++which corrupted conversion rates and classification targets. These tests pin
++the equivalence behaviour, including against the shipped sample workbook in
++its raw, uncleaned state.
++"""
++
++import numpy as np
++import pandas as pd
++import pytest
++
++from analyses import campaign_comparison, channel_performance, purchase_prediction
++from services.data_cleaner import apply_cleaning_actions
++from utils.helpers import infer_positive_value, normalise_label, positive_mask
++
++from tests.sample_workbook import load_sample_customer_data
++
++MESSY_AFFIRMATIVES = ["Yes", "yes", "Y", "Purchased"]
++MESSY_NEGATIVES = ["No", "no", "N"]
++
++
++def _messy_outcome_series():
++    return pd.Series(MESSY_AFFIRMATIVES + MESSY_NEGATIVES + [None])
++
++
++# ---------------------------------------------------------------------------
++# positive_mask
++# ---------------------------------------------------------------------------
++
++def test_positive_mask_matches_every_affirmative_spelling():
++    series = _messy_outcome_series()
++    mask = positive_mask(series, "Yes")
++    assert mask.sum() == len(MESSY_AFFIRMATIVES)
++    assert list(series[mask]) == MESSY_AFFIRMATIVES
++
++
++@pytest.mark.parametrize("chosen", MESSY_AFFIRMATIVES)
++def test_positive_mask_is_independent_of_which_affirmative_is_chosen(chosen):
++    """'Purchased' and 'Y' must behave identically to 'Yes' - the user's pick
++    of positive value should not change how many conversions are counted."""
++    series = _messy_outcome_series()
++    assert positive_mask(series, chosen).sum() == len(MESSY_AFFIRMATIVES)
++
++
++def test_positive_mask_matches_every_negative_spelling():
++    series = _messy_outcome_series()
++    mask = positive_mask(series, "No")
++    assert mask.sum() == len(MESSY_NEGATIVES)
++
++
++def test_positive_mask_never_matches_missing_values():
++    series = _messy_outcome_series()
++    assert not positive_mask(series, "Yes")[series.isna()].any()
++
++
++def test_positive_mask_does_not_merge_unrelated_categories():
++    """Equivalence only applies to recognisable yes/no columns - a campaign
++    column must still match one campaign, not every campaign."""
++    series = pd.Series(["Campaign A", "Campaign B", "Campaign C"])
++    assert positive_mask(series, "Campaign A").sum() == 1
++
++
++def test_positive_mask_still_normalises_case_for_non_yes_no_columns():
++    series = pd.Series(["Campaign A", "campaign a", " CAMPAIGN A ", "Campaign B"])
++    assert positive_mask(series, "Campaign A").sum() == 3
++
++
++def test_positive_mask_keeps_three_valued_columns_exact():
++    """'Maybe' makes this not a yes/no column, so no spellings are merged."""
++    series = pd.Series(["Yes", "Y", "No", "Maybe"])
++    assert positive_mask(series, "Yes").sum() == 1
++
++
++def test_positive_mask_handles_numeric_outcomes_directly():
++    series = pd.Series([1, 0, 1, 1, 0])
++    assert positive_mask(series, 1).sum() == 3
++
++
++def test_positive_mask_handles_float_outcomes_without_text_mangling():
++    """Normalising 1.0 as text would strip the dot and produce '10'."""
++    series = pd.Series([1.0, 0.0, 1.0])
++    assert positive_mask(series, 1.0).sum() == 2
++
++
++def test_positive_mask_handles_boolean_outcomes():
++    series = pd.Series([True, False, True])
++    assert positive_mask(series, True).sum() == 2
++
++
++def test_positive_mask_with_no_positive_value_matches_nothing():
++    assert positive_mask(_messy_outcome_series(), None).sum() == 0
++
++
++# ---------------------------------------------------------------------------
++# infer_positive_value
++# ---------------------------------------------------------------------------
++
++def test_infer_positive_value_prefers_the_most_common_affirmative():
++    """Row order used to decide this, so a 14-row 'Purchased' could beat a
++    265-row 'Yes'. The most recognisable spelling should win."""
++    series = pd.Series(["no"] + ["Purchased"] * 3 + ["Yes"] * 20 + ["No"] * 10)
++    assert infer_positive_value(series) == "Yes"
++
++
++def test_infer_positive_value_falls_back_when_nothing_looks_affirmative():
++    series = pd.Series(["Group A", "Group B"])
++    assert infer_positive_value(series) == "Group A"
++
++
++def test_infer_positive_value_returns_none_for_empty_column():
++    assert infer_positive_value(pd.Series([None, np.nan], dtype=object)) is None
++
++
++# ---------------------------------------------------------------------------
++# End-to-end: messy labels must not change the analysis conclusion
++# ---------------------------------------------------------------------------
++
++def _campaign_df(n=400, seed=4, messy=False):
++    rng = np.random.default_rng(seed)
++    campaign = rng.choice(["A", "B"], n)
++    base_prob = np.where(campaign == "B", 0.5, 0.3)
++    purchased = np.where(rng.random(n) < base_prob, "Yes", "No")
++    if messy:
++        # Spell the same two outcomes several ways, as a real export would.
++        yes_variants = rng.choice(MESSY_AFFIRMATIVES, n)
++        no_variants = rng.choice(MESSY_NEGATIVES, n)
++        purchased = np.where(purchased == "Yes", yes_variants, no_variants)
++    return pd.DataFrame({"campaign": campaign, "purchased": purchased})
++
++
++def test_campaign_comparison_conversion_rates_survive_messy_labels():
++    clean = campaign_comparison.run_analysis(
++        _campaign_df(), "campaign", "purchased", None, None, "A", "B")
++    messy = campaign_comparison.run_analysis(
++        _campaign_df(messy=True), "campaign", "purchased", None, None, "A", "B")
++
++    assert clean["ok"] and messy["ok"]
++    assert messy["control_conversion_rate"] == pytest.approx(clean["control_conversion_rate"])
++    assert messy["test_conversion_rate"] == pytest.approx(clean["test_conversion_rate"])
++    assert messy["p_value"] == pytest.approx(clean["p_value"])
++    assert messy["better_campaign"] == clean["better_campaign"] == "B"
++
++
++def test_channel_performance_conversion_rates_survive_messy_labels():
++    df = _campaign_df(messy=True)
++    result = channel_performance.run_analysis(df, "campaign", None, None, "purchased")
++    assert result["ok"]
++    rates = result["channel_summary"]["Conversion rate"]
++    # Roughly 30% and 50% by construction - not the ~12% a single spelling would give.
++    assert rates.min() > 0.2
++    assert rates.max() > 0.4
++
++
++def _classification_df(n=300, seed=2, messy=False):
++    rng = np.random.default_rng(seed)
++    visits = rng.poisson(4, n)
++    recency = rng.exponential(30, n)
++    score = 0.5 * visits - 0.05 * recency + rng.normal(0, 1, n)
++    purchased = np.where(score > np.median(score), "Yes", "No")
++    if messy:
++        purchased = np.where(purchased == "Yes",
++                             rng.choice(MESSY_AFFIRMATIVES, n),
++                             rng.choice(MESSY_NEGATIVES, n))
++    return pd.DataFrame({"visits": visits, "recency": recency, "purchased": purchased})
++
++
++def test_purchase_prediction_target_survives_messy_labels():
++    """Half the rows are buyers by construction; a single-spelling match used to
++    collapse that to a quarter of them and inflate accuracy on the imbalance."""
++    result = purchase_prediction.run_analysis(
++        _classification_df(messy=True), "purchased", ["visits", "recency"], {})
++    assert result["ok"]
++    assert result["auc"] is not None and result["auc"] > 0.7
++    assert result["n_high"] > 0
++
++
++# ---------------------------------------------------------------------------
++# The shipped sample workbook, exactly as a user would first upload it
++# ---------------------------------------------------------------------------
++
++def test_sample_data_still_ships_mixed_outcome_spellings():
++    """Guards the premise of the tests below - if the generator is ever changed
++    to emit clean labels, these regressions would silently stop testing anything."""
++    df = load_sample_customer_data()
++    spellings = {normalise_label(v) for v in df["Purchased"].dropna().unique()}
++    assert {"yes", "y", "purchased"}.issubset(spellings)
++    assert {"no", "n"}.issubset(spellings)
++
++
++@pytest.mark.parametrize("chosen", MESSY_AFFIRMATIVES)
++def test_sample_data_purchase_prediction_target_is_spelling_independent(chosen):
++    """Whichever affirmative spelling reaches run_analysis - inferred, or picked
++    by the user on the Choose a Question page - the model must train on the same
++    ~47% of buyers, not on the 2% that spell it one particular way."""
++    df = load_sample_customer_data()
++    factors = ["Website_Visits", "Purchase_Frequency", "Income"]
++
++    result = purchase_prediction.run_analysis(df, "Purchased", factors, {}, positive_value=chosen)
++    assert result["ok"]
++
++    # Buyers are roughly half the file, so the degenerate all-negative model that
++    # used to score 97% accuracy cannot occur, and the imbalance warning must not fire.
++    assert result["accuracy"] < 0.9
++    assert not any("far more common" in w for w in result["limitations"])
++    assert result["n_high"] > 0
++
++
++def test_sample_data_purchase_prediction_matches_cleaned_result():
++    raw = load_sample_customer_data()
++    cleaned, _ = apply_cleaning_actions(raw, {"standardise_labels": True}, {})
++    factors = ["Website_Visits", "Purchase_Frequency", "Income"]
++
++    raw_result = purchase_prediction.run_analysis(raw, "Purchased", factors, {})
++    cleaned_result = purchase_prediction.run_analysis(cleaned, "Purchased", factors, {})
++
++    assert raw_result["accuracy"] == pytest.approx(cleaned_result["accuracy"])
++    assert raw_result["auc"] == pytest.approx(cleaned_result["auc"])
++    assert raw_result["n_high"] == cleaned_result["n_high"]
++
++
++def test_sample_data_campaign_comparison_matches_cleaned_result():
++    """Standardising labels on the Data Quality page is an optional step. The
++    conclusion must not depend on whether the user happened to take it."""
++    raw = load_sample_customer_data()
++    cleaned, _ = apply_cleaning_actions(raw, {"standardise_labels": True}, {})
++
++    raw_result = campaign_comparison.run_analysis(
++        raw, "Campaign", "Purchased", None, None, "Campaign A", "Campaign B")
++    cleaned_result = campaign_comparison.run_analysis(
++        cleaned, "Campaign", "Purchased", None, None, "Campaign A", "Campaign B")
++
++    assert raw_result["control_conversion_rate"] == pytest.approx(
++        cleaned_result["control_conversion_rate"])
++    assert raw_result["test_conversion_rate"] == pytest.approx(
++        cleaned_result["test_conversion_rate"])
++    assert raw_result["p_value"] == pytest.approx(cleaned_result["p_value"])
++    assert raw_result["better_campaign"] == cleaned_result["better_campaign"]
++    # Conversion sits near 50%, not the ~2% a single spelling produced.
++    assert raw_result["control_conversion_rate"] > 0.3
+diff --git a/utils/helpers.py b/utils/helpers.py
+index bc60eb8..14f136b 100644
+--- a/utils/helpers.py
++++ b/utils/helpers.py
+@@ -100,20 +100,71 @@ POSITIVE_LABEL_TOKENS = {
+     "yes", "y", "true", "1", "purchased", "converted", "active", "churned", "bought", "responded",
+ }
+ 
++# Normalised spellings that mean the same thing in a Yes/No outcome column. Real
++# spreadsheets mix these freely ("Yes", "Y", "yes", "Purchased" in one column), so
++# matching a single exact string would silently count most buyers as non-buyers.
++# Only unambiguous synonyms live here - domain-specific words like "active" or
++# "churned" are deliberately excluded, since they pair with different opposites
++# depending on what the column means.
++AFFIRMATIVE_LABEL_TOKENS = {
++    "yes", "y", "true", "t", "1", "purchased", "purchase", "converted", "bought", "responded",
++}
++NEGATIVE_LABEL_TOKENS = {
++    "no", "n", "false", "f", "0", "notpurchased", "didnotpurchase", "notconverted",
++    "notbought", "notresponded", "none",
++}
++
+ 
+ def infer_positive_value(series: pd.Series):
+     """Pick the value that should count as the 'positive' outcome (e.g. 'Yes' over 'No').
+ 
+-    Prefers values that look affirmative by name; falls back to the first
+-    non-null unique value if nothing matches so behaviour stays deterministic.
++    Prefers the most common affirmative-looking spelling, so a column mixing
++    'Yes', 'Y' and 'Purchased' reports the label the user is most likely to
++    recognise. Falls back to the first non-null unique value if nothing looks
++    affirmative, so behaviour stays deterministic.
+     """
+-    uniques = series.dropna().unique().tolist()
+-    if not uniques:
++    non_null = series.dropna()
++    if non_null.empty:
+         return None
+-    for value in uniques:
+-        if normalise_label(value) in POSITIVE_LABEL_TOKENS:
+-            return value
+-    return uniques[0]
++    counts = non_null.value_counts()
++    affirmative = [v for v in counts.index if normalise_label(v) in POSITIVE_LABEL_TOKENS]
++    if affirmative:
++        return affirmative[0]
++    return non_null.unique().tolist()[0]
++
++
++def positive_mask(series: pd.Series, positive_value) -> pd.Series:
++    """Boolean mask of rows counting as the positive outcome.
++
++    Plain `series == positive_value` is wrong for real spreadsheets: a column
++    holding 'Yes', 'yes', 'Y' and 'Purchased' would match only one spelling and
++    treat the rest as negatives, corrupting conversion rates and model targets.
++
++    Matching rules, most permissive first:
++      - Numeric/boolean columns compare directly (no text normalisation).
++      - If every value in the column is a recognisable yes/no token, any
++        affirmative spelling matches any other affirmative spelling.
++      - Otherwise values are compared after normalising case, whitespace and
++        punctuation, so 'Campaign A' still only matches 'Campaign A'.
++    """
++    if positive_value is None:
++        return pd.Series(False, index=series.index)
++
++    if pd.api.types.is_numeric_dtype(series) or pd.api.types.is_bool_dtype(series):
++        return (series == positive_value).fillna(False)
++
++    not_null = series.notna()
++    normalised = series.map(normalise_label)
++    target = normalise_label(positive_value)
++
++    distinct = set(normalised[not_null])
++    if distinct and distinct.issubset(AFFIRMATIVE_LABEL_TOKENS | NEGATIVE_LABEL_TOKENS):
++        if target in AFFIRMATIVE_LABEL_TOKENS:
++            return normalised.isin(AFFIRMATIVE_LABEL_TOKENS) & not_null
++        if target in NEGATIVE_LABEL_TOKENS:
++            return normalised.isin(NEGATIVE_LABEL_TOKENS) & not_null
++
++    return (normalised == target) & not_null
+ 
+ 
+ def sample_size_warning(n_rows: int, min_rows: int = 30) -> str | None:
+-- 
+2.50.1 (Apple Git-155)
+
