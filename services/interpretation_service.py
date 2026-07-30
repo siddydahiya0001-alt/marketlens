@@ -98,6 +98,7 @@ class RuleBasedInterpreter(InterpretationService):
             f"The model explains about {round(r2 * 100)}% of the change in {target_label} - the rest comes "
             "from factors not included in this analysis, or from randomness."
         )
+
         confidence_label = confidence_from_p_value(p_value)
         if confidence_label in ("Very high confidence", "High confidence") and r2 < 0.3:
             # Confidence (is the pattern real?) and R-squared (how much does it explain?) answer
@@ -118,6 +119,7 @@ class RuleBasedInterpreter(InterpretationService):
                 "Confidence could not be calculated for the overall model.",
             "reasoning_steps": reasoning_steps,
         }
+
 
     def interpret_classification(self, result: dict) -> dict:
         accuracy = result.get("accuracy", 0)
@@ -156,6 +158,7 @@ class RuleBasedInterpreter(InterpretationService):
             "reasoning_steps": reasoning_steps,
         }
 
+
     def interpret_segmentation(self, result: dict) -> dict:
         n_groups = result.get("n_groups", 0)
         silhouette = result.get("silhouette_score", 0)
@@ -184,11 +187,11 @@ class RuleBasedInterpreter(InterpretationService):
             "reasoning_steps": reasoning_steps,
         }
 
+
     def interpret_campaign_comparison(self, result: dict) -> dict:
         diff_pct = result.get("conversion_diff_pct", 0)
         better = result.get("better_campaign", "The tested campaign")
         p_value = result.get("p_value")
-        direction = "higher" if diff_pct >= 0 else "lower"
 
         n_control = result.get("n_control", 0)
         n_test = result.get("n_test", 0)
@@ -219,15 +222,40 @@ class RuleBasedInterpreter(InterpretationService):
             )
 
         return {
-            "main_answer": (
-                f"'{better}' produced a {abs(diff_pct):.0f}% {direction} conversion rate than "
-                f"'{comparison_group}'."
+            "main_answer": _campaign_headline(
+                better, comparison_group, diff_pct, control_group, control_rate, test_rate,
             ),
             "explanation": confidence_sentence(p_value) if p_value is not None else
                 "Not enough information to judge statistical confidence.",
             "confidence": confidence_from_p_value(p_value) if p_value is not None else "Not enough evidence",
             "reasoning_steps": reasoning_steps,
         }
+
+
+def _campaign_headline(better, comparison_group, diff_pct, control_group, control_rate, test_rate) -> str:
+    """State which group converted better, by how much, and on what base.
+
+    `better_campaign` is always the higher-converting group, so the comparison
+    reads "higher" from its point of view regardless of which side happened to
+    be the test group. Deriving the wording from the sign of the difference
+    instead - which is measured from the *test* group - flipped the sentence
+    whenever the control group won, reporting the winner as the loser.
+
+    The gap is stated in percentage points, not "%": a move from 40.6% to 51.8%
+    is 11.2 percentage points, not an 11.2% increase.
+    """
+    if diff_pct == 0:
+        return f"'{better}' and '{comparison_group}' converted at the same rate."
+
+    better_rate = control_rate if better == control_group else test_rate
+    worse_rate = test_rate if better == control_group else control_rate
+
+    sentence = (
+        f"'{better}' converted {abs(diff_pct):.1f} percentage points higher than '{comparison_group}'"
+    )
+    if better_rate is not None and worse_rate is not None:
+        sentence += f" ({better_rate * 100:.1f}% versus {worse_rate * 100:.1f}%)"
+    return sentence + "."
 
 
 def _confidence_from_accuracy(accuracy: float) -> str:
