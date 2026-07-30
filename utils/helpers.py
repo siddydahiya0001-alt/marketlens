@@ -100,20 +100,71 @@ POSITIVE_LABEL_TOKENS = {
     "yes", "y", "true", "1", "purchased", "converted", "active", "churned", "bought", "responded",
 }
 
+# Normalised spellings that mean the same thing in a Yes/No outcome column. Real
+# spreadsheets mix these freely ("Yes", "Y", "yes", "Purchased" in one column), so
+# matching a single exact string would silently count most buyers as non-buyers.
+# Only unambiguous synonyms live here - domain-specific words like "active" or
+# "churned" are deliberately excluded, since they pair with different opposites
+# depending on what the column means.
+AFFIRMATIVE_LABEL_TOKENS = {
+    "yes", "y", "true", "t", "1", "purchased", "purchase", "converted", "bought", "responded",
+}
+NEGATIVE_LABEL_TOKENS = {
+    "no", "n", "false", "f", "0", "notpurchased", "didnotpurchase", "notconverted",
+    "notbought", "notresponded", "none",
+}
+
 
 def infer_positive_value(series: pd.Series):
     """Pick the value that should count as the 'positive' outcome (e.g. 'Yes' over 'No').
 
-    Prefers values that look affirmative by name; falls back to the first
-    non-null unique value if nothing matches so behaviour stays deterministic.
+    Prefers the most common affirmative-looking spelling, so a column mixing
+    'Yes', 'Y' and 'Purchased' reports the label the user is most likely to
+    recognise. Falls back to the first non-null unique value if nothing looks
+    affirmative, so behaviour stays deterministic.
     """
-    uniques = series.dropna().unique().tolist()
-    if not uniques:
+    non_null = series.dropna()
+    if non_null.empty:
         return None
-    for value in uniques:
-        if normalise_label(value) in POSITIVE_LABEL_TOKENS:
-            return value
-    return uniques[0]
+    counts = non_null.value_counts()
+    affirmative = [v for v in counts.index if normalise_label(v) in POSITIVE_LABEL_TOKENS]
+    if affirmative:
+        return affirmative[0]
+    return non_null.unique().tolist()[0]
+
+
+def positive_mask(series: pd.Series, positive_value) -> pd.Series:
+    """Boolean mask of rows counting as the positive outcome.
+
+    Plain `series == positive_value` is wrong for real spreadsheets: a column
+    holding 'Yes', 'yes', 'Y' and 'Purchased' would match only one spelling and
+    treat the rest as negatives, corrupting conversion rates and model targets.
+
+    Matching rules, most permissive first:
+    - Numeric/boolean columns compare directly (no text normalisation).
+    - If every value in the column is a recognisable yes/no token, any
+      affirmative spelling matches any other affirmative spelling.
+    - Otherwise values are compared after normalising case, whitespace and
+      punctuation, so 'Campaign A' still only matches 'Campaign A'.
+    """
+    if positive_value is None:
+        return pd.Series(False, index=series.index)
+
+    if pd.api.types.is_numeric_dtype(series) or pd.api.types.is_bool_dtype(series):
+        return (series == positive_value).fillna(False)
+
+    not_null = series.notna()
+    normalised = series.map(normalise_label)
+    target = normalise_label(positive_value)
+
+    distinct = set(normalised[not_null])
+    if distinct and distinct.issubset(AFFIRMATIVE_LABEL_TOKENS | NEGATIVE_LABEL_TOKENS):
+        if target in AFFIRMATIVE_LABEL_TOKENS:
+            return normalised.isin(AFFIRMATIVE_LABEL_TOKENS) & not_null
+        if target in NEGATIVE_LABEL_TOKENS:
+            return normalised.isin(NEGATIVE_LABEL_TOKENS) & not_null
+
+    return (normalised == target) & not_null
 
 
 def sample_size_warning(n_rows: int, min_rows: int = 30) -> str | None:
