@@ -17,24 +17,57 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
 from services import validation_service as vs
-from utils.helpers import slugify, infer_positive_value
+from utils.helpers import slugify, infer_positive_value, positive_mask
 
-RISK_INCREASES_WITH_VALUE = ["recency", "dayssince", "delay", "complaint", "cost", "churn"]
-RISK_DECREASES_WITH_VALUE = ["frequency", "visit", "engagement", "loyalty", "tenure", "spend", "revenue", "purchase"]
+# Keywords are matched against a *compacted* slug (separators removed), so a
+# multi-word keyword like "dayssince" matches a real column name such as
+# "Days_Since_Last_Purchase". Matching against the underscored slug would never
+# fire, and the name would then fall through to the risk-decreasing list on the
+# stray word "purchase" - scoring the most dormant customers as the safest.
+#
+# Order matters: "since"/"recency" style signals are checked first, because a
+# column like "days_since_last_purchase" contains a risk-decreasing word too and
+# the recency meaning must win.
+RISK_INCREASES_WITH_VALUE = [
+    "recency", "dayssince", "since", "lapsed", "dormant", "inactive",
+    "delay", "late", "complaint", "refund", "cancel", "churn",
+    "unsubscrib", "bounce", "cost",
+]
+RISK_DECREASES_WITH_VALUE = [
+    "frequency", "visit", "session", "login", "click", "open", "engagement",
+    "loyalty", "tenure", "subscription", "spend", "revenue", "sales", "profit",
+    "margin", "income", "ordervalue", "aov", "monetary", "basket", "purchase",
+]
 
 FRIENDLY_REASON = {
     "recency": "the customer has not purchased recently",
     "dayssince": "the customer has not purchased recently",
+    "since": "the customer has not purchased recently",
+    "lapsed": "the customer has gone quiet",
+    "dormant": "the customer has gone quiet",
     "delay": "recent orders had delivery delays",
     "complaint": "a recent complaint was recorded",
+    "refund": "a recent refund was recorded",
+    "cancel": "a recent cancellation was recorded",
     "frequency": "purchase frequency has declined",
     "visit": "website engagement has dropped",
+    "session": "website engagement has dropped",
+    "login": "the customer signs in less often",
     "engagement": "engagement has dropped",
+    "spend": "spending has fallen below the typical level",
+    "revenue": "spending has fallen below the typical level",
+    "ordervalue": "order values are below the typical level",
 }
 
 
+def _compact_slug(col: str) -> str:
+    """Slug with separators removed, so multi-word keywords match real column names."""
+    return slugify(col).replace("_", "")
+
+
 def _direction_for_column(col: str) -> int:
-    slug = slugify(col)
+    """+1 if a higher value means more churn risk, -1 if a higher value means less."""
+    slug = _compact_slug(col)
     for keyword in RISK_INCREASES_WITH_VALUE:
         if keyword in slug:
             return 1
@@ -45,11 +78,11 @@ def _direction_for_column(col: str) -> int:
 
 
 def _friendly_reason(col: str) -> str:
-    slug = slugify(col)
+    slug = _compact_slug(col)
     for keyword, phrase in FRIENDLY_REASON.items():
         if keyword in slug:
             return phrase
-    return f"'{col}' is unusual compared to other customers"
+    return _generic_reason(col)
 
 
 def run_analysis(df: pd.DataFrame, risk_signal_cols: list, roles: dict, known_churn_col: str | None = None) -> dict:
@@ -76,6 +109,63 @@ def run_analysis(df: pd.DataFrame, risk_signal_cols: list, roles: dict, known_ch
     return result
 
 
+NO_STANDOUT_REASON = "no individual warning signal stands out for this customer"
+
+
+def _generic_reason(col: str) -> str:
+    return f"'{col}' is unusual compared to other customers"
+
+
+def _main_risk_reasons(risk_contributions: pd.DataFrame, phrase_for=None) -> pd.Series:
+    """Name the signal pushing each customer's risk *up* the hardest.
+
+    Takes a frame where a positive value means "this signal raises risk" and a
+    negative value means "this signal lowers it". Picking the largest magnitude
+    regardless of sign would name a protective factor as a risk reason - a
+    customer buying far more often than average would be told their "purchase
+    frequency has declined". Only signals above zero can be a reason, and a
+    customer whose signals are all protective is told so honestly rather than
+    being given the least reassuring one.
+    """
+    phrase_for = phrase_for or _friendly_reason
+    strongest = risk_contributions.idxmax(axis=1)
+    has_risk_signal = risk_contributions.max(axis=1) > 0
+    return strongest.map(phrase_for).where(has_risk_signal, NO_STANDOUT_REASON)
+
+
+def _trustworthy_phrase_lookup(coefficients: pd.Series):
+    """Phrase chooser for the supervised model.
+
+    The friendly phrases are written for the direction business sense expects
+    ("purchase frequency has declined" assumes low frequency is the risky end).
+    A trained model can learn the opposite sign from the data, and reusing the
+    phrase then states the reverse of what the model actually found. Where the
+    learned sign disagrees with the expected direction, fall back to neutral
+    wording that stays true either way.
+    """
+    def phrase_for(col: str) -> str:
+        learned_direction = 1 if coefficients.get(col, 0) > 0 else -1
+        if learned_direction != _direction_for_column(col):
+            return _generic_reason(col)
+        return _friendly_reason(col)
+
+    return phrase_for
+
+
+def _top_reasons_for_high_risk(risk_df: pd.DataFrame) -> list:
+    """Most common reasons among the high-risk customers specifically.
+
+    The headline and recommendations talk about why the *at-risk* customers are
+    at risk, so counting reasons across everyone would let the low-risk majority
+    decide what the at-risk group is told to do. Falls back to the whole
+    population when nothing reached the high-risk band.
+    """
+    high_risk = risk_df[risk_df["Risk group"] == "High"]
+    population = high_risk if len(high_risk) else risk_df
+    counts = population["Main risk reason"].value_counts()
+    return [reason for reason in counts.index.tolist() if reason != NO_STANDOUT_REASON]
+
+
 def _heuristic_risk(df: pd.DataFrame, numeric_cols: list, warnings: list) -> dict:
     scaler = StandardScaler()
     z = pd.DataFrame(scaler.fit_transform(df[numeric_cols]), columns=numeric_cols, index=df.index)
@@ -88,16 +178,14 @@ def _heuristic_risk(df: pd.DataFrame, numeric_cols: list, warnings: list) -> dic
     raw_score = signed.mean(axis=1)
     risk_score_0_100 = ((raw_score - raw_score.min()) / (raw_score.max() - raw_score.min() + 1e-9) * 100)
 
-    main_reason_idx = signed.abs().idxmax(axis=1)
-    main_reasons = main_reason_idx.map(_friendly_reason)
+    main_reasons = _main_risk_reasons(signed)
 
     risk_df = df.copy()
     risk_df["Risk score"] = risk_score_0_100.round(1)
     risk_df["Main risk reason"] = main_reasons
     risk_df["Risk group"] = pd.cut(risk_score_0_100, bins=[-1, 33, 66, 100], labels=["Low", "Medium", "High"])
 
-    reason_counts = main_reasons.value_counts()
-    top_reasons = reason_counts.index.tolist()
+    top_reasons = _top_reasons_for_high_risk(risk_df)
 
     warnings.append(
         "No confirmed churn outcome was provided, so this risk score is based on behaviour patterns "
@@ -119,7 +207,7 @@ def _heuristic_risk(df: pd.DataFrame, numeric_cols: list, warnings: list) -> dic
 
 def _supervised_risk(df: pd.DataFrame, numeric_cols: list, churn_col: str, warnings: list) -> dict:
     positive_value = infer_positive_value(df[churn_col])
-    y = (df[churn_col] == positive_value).astype(int)
+    y = positive_mask(df[churn_col], positive_value).astype(int)
     warnings += vs.check_target_outcomes(y.map({1: "Yes", 0: "No"}))
 
     scaler = StandardScaler()
@@ -136,15 +224,14 @@ def _supervised_risk(df: pd.DataFrame, numeric_cols: list, churn_col: str, warni
     coefs = pd.Series(model.coef_[0], index=numeric_cols)
     contributions = X * coefs
 
-    main_reason_idx = contributions.abs().idxmax(axis=1)
-    main_reasons = main_reason_idx.map(_friendly_reason)
+    main_reasons = _main_risk_reasons(contributions, _trustworthy_phrase_lookup(coefs))
 
     risk_df = df.copy()
     risk_df["Risk score"] = (probabilities * 100).round(1)
     risk_df["Main risk reason"] = main_reasons
     risk_df["Risk group"] = pd.cut(probabilities * 100, bins=[-1, 33, 66, 100], labels=["Low", "Medium", "High"])
 
-    top_reasons = main_reasons.value_counts().index.tolist()
+    top_reasons = _top_reasons_for_high_risk(risk_df)
 
     return {
         "ok": True,
@@ -184,6 +271,7 @@ def render(result: dict, df: pd.DataFrame, roles: dict, config: dict, settings: 
 
     n_total = result["n_high"] + result["n_medium"] + result["n_low"]
     signal_cols = result.get("risk_signal_cols", [])
+
     if result["mode"] == "supervised":
         reasoning_steps = [
             f"You provided a column with a known outcome, so we trained a statistical model that estimates "
