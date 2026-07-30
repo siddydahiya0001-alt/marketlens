@@ -12,7 +12,7 @@ from sklearn.metrics import (
 )
 
 from services import validation_service as vs
-from utils.helpers import infer_positive_value
+from utils.helpers import infer_positive_value, positive_mask
 
 
 def _encode_features(df: pd.DataFrame, factor_cols: list) -> pd.DataFrame:
@@ -46,7 +46,7 @@ def run_analysis(df: pd.DataFrame, outcome_col: str, factor_cols: list, roles: d
 
     if positive_value is None:
         positive_value = infer_positive_value(working[outcome_col])
-    y = (working[outcome_col] == positive_value).astype(int)
+    y = positive_mask(working[outcome_col], positive_value).astype(int)
 
     warnings += vs.check_target_outcomes(y.map({1: "Yes", 0: "No"}))
     warnings += vs.check_missing_data(working, clean_factors)
