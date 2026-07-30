@@ -5,7 +5,7 @@ from __future__ import annotations
 import pandas as pd
 
 from services import validation_service as vs
-from utils.helpers import safe_divide, infer_positive_value
+from utils.helpers import safe_divide, infer_positive_value, positive_mask
 
 
 def run_analysis(df: pd.DataFrame, channel_col: str, revenue_col: str | None, cost_col: str | None,
@@ -26,8 +26,9 @@ def run_analysis(df: pd.DataFrame, channel_col: str, revenue_col: str | None, co
 
     if outcome_col and outcome_col in df.columns:
         positive_value = infer_positive_value(df[outcome_col]) if df[outcome_col].notna().any() else None
-        conv = df.groupby(channel_col)[outcome_col].apply(
-            lambda s: safe_divide((s == positive_value).sum(), len(s))
+        converted = positive_mask(df[outcome_col], positive_value)
+        conv = converted.groupby(df[channel_col]).apply(
+            lambda s: safe_divide(s.sum(), len(s))
         ).reset_index()
         conv.columns = [channel_col, "Conversion rate"]
         channel_summary = channel_summary.merge(conv, on=channel_col, how="left")
