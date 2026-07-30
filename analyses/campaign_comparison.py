@@ -7,7 +7,7 @@ import pandas as pd
 from statsmodels.stats.proportion import proportions_ztest, proportion_confint
 
 from services import validation_service as vs
-from utils.helpers import safe_divide, infer_positive_value
+from utils.helpers import safe_divide, infer_positive_value, positive_mask
 
 
 def run_analysis(df: pd.DataFrame, campaign_col: str, outcome_col: str, revenue_col: str | None,
@@ -30,9 +30,13 @@ def run_analysis(df: pd.DataFrame, campaign_col: str, outcome_col: str, revenue_
     warnings += vs.check_dataset_size(control_df, min_rows=20)
     warnings += vs.check_dataset_size(test_df, min_rows=20)
 
+    # Decide what counts as a conversion across the whole column, then slice - so both
+    # groups are scored against the same rule even if one group happens to use only a
+    # subset of the spellings present in the data.
     positive_value = infer_positive_value(df[outcome_col])
-    control_conversions = int((control_df[outcome_col] == positive_value).sum())
-    test_conversions = int((test_df[outcome_col] == positive_value).sum())
+    converted = positive_mask(df[outcome_col], positive_value)
+    control_conversions = int(converted.loc[control_df.index].sum())
+    test_conversions = int(converted.loc[test_df.index].sum())
     n_control, n_test = len(control_df), len(test_df)
 
     control_rate = safe_divide(control_conversions, n_control)
